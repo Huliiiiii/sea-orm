@@ -2,9 +2,12 @@ use crate::{ActiveEnum, ColumnOption, Entity, util::escape_rust_keyword};
 use heck::ToUpperCamelCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 use syn::{punctuated::Punctuated, token::Comma};
-use tracing::info;
+use tracing::{info, warn};
 
 mod compact;
 mod dense;
@@ -445,17 +448,51 @@ impl EntityWriter {
         if with_prelude == WithPrelude::AllAllowUnusedImports {
             Self::write_allow_unused_imports(&mut lines)
         }
-        let code_blocks = self
-            .entities
-            .iter()
-            .map({
-                if entity_format == EntityFormat::Frontend {
-                    Self::gen_prelude_use_model
-                } else {
-                    Self::gen_prelude_use
+
+        let prelude_use = if entity_format == EntityFormat::Frontend {
+            Self::gen_prelude_use_model
+        } else {
+            Self::gen_prelude_use
+        };
+        let mut code_blocks: Vec<TokenStream> = self.entities.iter().map(prelude_use).collect();
+        if !self.enums.is_empty() {
+            let mut used_names: BTreeSet<_> = self
+                .entities
+                .iter()
+                .map(|entity| entity.get_table_name_camel_case())
+                .collect();
+            let mut enum_idents = Vec::new();
+            let mut has_skipped = false;
+
+            for active_enum in self.enums.values() {
+                let enum_name = active_enum.enum_name.as_str();
+                let enum_ident = enum_name.to_upper_camel_case();
+
+                if used_names.contains(&enum_ident) {
+                    warn!(
+                        "Skipping active enum `{}` in prelude because it conflicts with existing import `{}`.",
+                        enum_name, enum_ident
+                    );
+                    has_skipped = true;
+                    continue;
                 }
-            })
-            .collect();
+
+                used_names.insert(enum_ident.clone());
+                enum_idents.push(enum_ident);
+            }
+
+            if !enum_idents.is_empty() && has_skipped {
+                code_blocks.extend(enum_idents.into_iter().map(|enum_ident| {
+                    quote! {
+                        pub use super::sea_orm_active_enums::#enum_ident;
+                    }
+                }));
+            } else {
+                code_blocks.push(quote! {
+                    pub use super::sea_orm_active_enums::*;
+                });
+            }
+        }
         Self::write(&mut lines, code_blocks);
         OutputFile {
             name: "prelude.rs".to_owned(),
